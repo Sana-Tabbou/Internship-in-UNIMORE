@@ -1,0 +1,803 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import soundfile as sf
+import sounddevice as sd
+from scipy import signal
+import librosa
+import librosa.display
+import warnings
+warnings.filterwarnings('ignore')
+
+# Vérification des dépendances
+try:
+    import vmdpy
+    VMD_AVAILABLE = True
+except ImportError:
+    VMD_AVAILABLE = False
+
+try:
+    import emd
+    EMD_AVAILABLE = True
+except ImportError:
+    EMD_AVAILABLE = False
+
+class LungSoundAnalyzer:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Lung Sound Analysis")
+        self.root.geometry("1400x900")
+        
+        # Style configuration with red theme
+        self.setup_style()
+        
+        # Variables
+        self.audio_data = None
+        self.sample_rate = None
+        self.processed_audio = None
+        self.decomposition_results = None
+        self.dataset_path = tk.StringVar()
+        self.current_file = tk.StringVar()
+        self.current_file_path = None
+        self.user_diagnosis = tk.StringVar()
+        self.true_diagnosis = ""
+        
+        # Paramètres de traitement
+        self.processing_method = tk.StringVar(value="No processing")
+        self.representation_method = tk.StringVar(value="STFT Spectrogram")
+        self.decomposition_method = tk.StringVar(value="VMD" if VMD_AVAILABLE else "EMD" if EMD_AVAILABLE else "")
+        
+        # Paramètres des filtres
+        self.low_cutoff = tk.DoubleVar(value=100)
+        self.high_cutoff = tk.DoubleVar(value=2000)
+        self.filter_order = tk.IntVar(value=4)
+        
+        # Paramètres VMD/VME
+        self.alpha = tk.DoubleVar(value=2000)
+        self.modes = tk.IntVar(value=2)
+        self.mode_to_show = tk.IntVar(value=0)
+        
+        # Historique
+        self.history = []
+        self.evaluation_history = []
+        
+        # Setup UI
+        self.setup_ui()
+    
+    def setup_style(self):
+        """Configure the red theme for the application"""
+        self.root.tk_setPalette(background='#f5f5f5', foreground='black',
+                              activeBackground='#ffcccc', activeForeground='black')
+        
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Configure colors
+        style.configure('.', background='#f5f5f5', foreground='black')
+        style.configure('TFrame', background='#f5f5f5')
+        style.configure('TLabel', background='#f5f5f5', foreground='black', font=('Helvetica', 10))
+        style.configure('TButton', font=('Helvetica', 10), padding=5, 
+                       background='#ff6666', foreground='black')
+        style.configure('Title.TLabel', font=('Helvetica', 12, 'bold'))
+        style.configure('TCombobox', selectbackground='#ff9999')
+        style.configure('TEntry', fieldbackground='white')
+        style.configure('TNotebook', background='#f5f5f5')
+        style.configure('TNotebook.Tab', background='#ff9999', padding=[10, 5])
+        style.map('TNotebook.Tab', background=[('selected', '#ff6666')])
+        style.configure('TLabelframe', background='#f5f5f5', bordercolor='#ff9999')
+        style.configure('TLabelframe.Label', background='#ff9999', foreground='black')
+        
+        style.map('TButton',
+                 background=[('active', '#ff9999'), ('pressed', '#ff3333')],
+                 foreground=[('active', 'black')])
+        
+    def setup_ui(self):
+        # Main frames
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        left_frame = ttk.Frame(main_frame, width=400)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+        
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Audio Control Section
+        audio_frame = ttk.LabelFrame(left_frame, text="Audio Control", padding=10)
+        audio_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(audio_frame, text="Dataset:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(audio_frame, textvariable=self.dataset_path, width=30).grid(row=0, column=1, padx=5)
+        ttk.Button(audio_frame, text="Browse", command=self.browse_dataset).grid(row=0, column=2)
+        ttk.Button(audio_frame, text="Random", command=self.load_random_file).grid(row=0, column=3, padx=5)
+        
+        ttk.Label(audio_frame, text="File:").grid(row=1, column=0, sticky=tk.W, pady=(10,0))
+        ttk.Entry(audio_frame, textvariable=self.current_file, state='readonly').grid(row=1, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=(10,0))
+        
+        btn_frame = ttk.Frame(audio_frame)
+        btn_frame.grid(row=2, column=0, columnspan=4, pady=(10,0))
+        
+        ttk.Button(btn_frame, text="Play Original", command=lambda: self.play_audio(False)).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Play Processed", command=lambda: self.play_audio(True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Stop", command=self.stop_audio).pack(side=tk.LEFT)
+        
+        # Processing Section
+        proc_frame = ttk.LabelFrame(left_frame, text="Signal Processing", padding=10)
+        proc_frame.pack(fill=tk.X, pady=5)
+        
+        notebook = ttk.Notebook(proc_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Basic Processing Tab
+        basic_tab = ttk.Frame(notebook)
+        notebook.add(basic_tab, text="Basic")
+        
+        ttk.Label(basic_tab, text="Method:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(basic_tab, textvariable=self.processing_method, 
+                    values=["No processing", "Low-pass filter", "High-pass filter", 
+                           "Band-pass filter", "HPSS"]).grid(row=0, column=1, padx=5, pady=2)
+        
+        self.params_frame = ttk.Frame(basic_tab)
+        self.params_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
+        
+        ttk.Button(basic_tab, text="Apply", command=self.apply_processing).grid(row=2, column=1, sticky=tk.E, pady=5)
+        
+        # Decomposition Tab
+        if VMD_AVAILABLE or EMD_AVAILABLE:
+            decomp_tab = ttk.Frame(notebook)
+            notebook.add(decomp_tab, text="Decomposition")
+            
+            methods = []
+            if VMD_AVAILABLE:
+                methods.extend(["VMD", "VME"])
+            if EMD_AVAILABLE:
+                methods.append("EMD")
+            
+            ttk.Label(decomp_tab, text="Method:").grid(row=0, column=0, sticky=tk.W)
+            ttk.Combobox(decomp_tab, textvariable=self.decomposition_method, 
+                        values=methods).grid(row=0, column=1, padx=5, pady=2)
+            
+            self.decomp_params_frame = ttk.Frame(decomp_tab)
+            self.decomp_params_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
+            
+            ttk.Button(decomp_tab, text="Apply", command=self.apply_decomposition).grid(row=2, column=1, sticky=tk.E, pady=5)
+            ttk.Button(decomp_tab, text="Show All Modes", command=self.plot_all_modes).grid(row=2, column=0, sticky=tk.W, pady=5)
+        
+        # Time-Frequency Analysis (0-2kHz)
+        tf_frame = ttk.LabelFrame(left_frame, text="Time-Frequency Analysis (0-2kHz)", padding=10)
+        tf_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(tf_frame, text="Method:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(tf_frame, textvariable=self.representation_method,
+                    values=["STFT Spectrogram", "Mel Spectrogram", "Gammatone Spectrogram"]).grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Button(tf_frame, text="Plot", command=self.plot_representation).grid(row=0, column=2, padx=5)
+        
+        # Diagnosis Section
+        diag_frame = ttk.LabelFrame(left_frame, text="Diagnosis", padding=10)
+        diag_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(diag_frame, text="Your diagnosis:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(diag_frame, textvariable=self.user_diagnosis,
+                    values=["Negative", "Positive"]).grid(row=0, column=1, padx=5)
+        
+        ttk.Button(diag_frame, text="Submit", command=self.submit_diagnosis).grid(row=1, column=1, sticky=tk.E, pady=5)
+        
+        # History
+        hist_frame = ttk.LabelFrame(left_frame, text="History", padding=10)
+        hist_frame.pack(fill=tk.X, pady=5)
+        
+        self.history_text = tk.Text(hist_frame, height=8, wrap=tk.WORD, bg='white', fg='black')
+        self.history_text.pack(fill=tk.BOTH, expand=True)
+        self.history_text.insert(tk.END, "No history yet\n")
+        self.history_text.config(state=tk.DISABLED)
+        
+        # Evaluation History
+        eval_frame = ttk.LabelFrame(left_frame, text="Evaluation History", padding=10)
+        eval_frame.pack(fill=tk.X, pady=5)
+        
+        self.eval_text = tk.Text(eval_frame, height=8, wrap=tk.WORD, bg='white', fg='black')
+        self.eval_text.pack(fill=tk.BOTH, expand=True)
+        self.eval_text.insert(tk.END, "No evaluations yet\n")
+        self.eval_text.config(state=tk.DISABLED)
+        
+        # Visualization
+        vis_frame = ttk.LabelFrame(right_frame, text="Visualization", padding=10)
+        vis_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.fig = Figure(figsize=(8, 6), dpi=100, facecolor='#f5f5f5')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=vis_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        toolbar = NavigationToolbar2Tk(self.canvas, vis_frame)
+        toolbar.update()
+        
+        # Initialize parameters
+        self.update_processing_params()
+        if VMD_AVAILABLE or EMD_AVAILABLE:
+            self.update_decomp_params()
+    
+    def browse_dataset(self):
+        folder = filedialog.askdirectory(title="Select Dataset Folder")
+        if folder:
+            self.dataset_path.set(folder)
+    
+    def extract_true_diagnosis(self, filepath):
+        """Extract the true diagnosis from the parent folder name"""
+        # Get the immediate parent directory of the file
+        parent_dir = os.path.basename(os.path.dirname(filepath)).lower()
+        
+        # Check if parent directory indicates the diagnosis
+        if 'negative' in parent_dir or 'normal' in parent_dir:
+            return "Negative"
+        elif 'positive' in parent_dir or 'abnormal' in parent_dir:
+            return "Positive"
+        else:
+            # If not found in immediate parent, check higher levels
+            path_parts = filepath.lower().split(os.sep)
+            for part in path_parts:
+                if 'negative' in part or 'normal' in part:
+                    return "Negative"
+                elif 'positive' in part or 'abnormal' in part:
+                    return "Positive"
+        
+        return "Unknown"
+    
+    def load_random_file(self):
+        if not self.dataset_path.get():
+            messagebox.showerror("Error", "Please select a dataset folder first")
+            return
+        
+        wav_files = []
+        for root, _, files in os.walk(self.dataset_path.get()):
+            for file in files:
+                if file.lower().endswith('.wav'):
+                    wav_files.append(os.path.join(root, file))
+        
+        if not wav_files:
+            messagebox.showerror("Error", "No WAV files found in selected folder")
+            return
+        
+        selected = random.choice(wav_files)
+        self.current_file.set(os.path.basename(selected))
+        self.current_file_path = selected
+        
+        # Extract and store true diagnosis from parent folder
+        self.true_diagnosis = self.extract_true_diagnosis(selected)
+        print(f"True diagnosis determined: {self.true_diagnosis}")  # Debug print
+        
+        try:
+            self.audio_data, self.sample_rate = sf.read(selected)
+            if len(self.audio_data.shape) > 1:
+                self.audio_data = np.mean(self.audio_data, axis=1)
+            
+            # Convert to float32 to save memory
+            self.audio_data = self.audio_data.astype(np.float32)
+            
+            # Limit signal length to 10 seconds
+            max_samples = self.sample_rate * 10
+            if len(self.audio_data) > max_samples:
+                self.audio_data = self.audio_data[:max_samples]
+            
+            self.processed_audio = self.audio_data.copy()
+            self.decomposition_results = None
+            
+            print(f"Loaded file with sample rate: {self.sample_rate}Hz")
+            
+            # Plot original signal by default
+            self.plot_waveform()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load audio file: {str(e)}")
+    
+    def update_processing_params(self, event=None):
+        for widget in self.params_frame.winfo_children():
+            widget.destroy()
+        
+        method = self.processing_method.get()
+        
+        if method in ["Low-pass filter", "High-pass filter", "Band-pass filter"]:
+            ttk.Label(self.params_frame, text="Low cutoff (Hz):").grid(row=0, column=0, sticky=tk.W)
+            ttk.Entry(self.params_frame, textvariable=self.low_cutoff, width=8).grid(row=0, column=1)
+            
+            if method == "Band-pass filter":
+                ttk.Label(self.params_frame, text="High cutoff (Hz):").grid(row=1, column=0, sticky=tk.W)
+                ttk.Entry(self.params_frame, textvariable=self.high_cutoff, width=8).grid(row=1, column=1)
+            
+            ttk.Label(self.params_frame, text="Order:").grid(row=2, column=0, sticky=tk.W)
+            ttk.Spinbox(self.params_frame, from_=1, to=10, textvariable=self.filter_order, width=5).grid(row=2, column=1)
+    
+    def update_decomp_params(self, event=None):
+        for widget in self.decomp_params_frame.winfo_children():
+            widget.destroy()
+        
+        method = self.decomposition_method.get()
+        
+        if method in ["VMD", "VME"] and VMD_AVAILABLE:
+            ttk.Label(self.decomp_params_frame, text="Alpha:").grid(row=0, column=0, sticky=tk.W)
+            ttk.Entry(self.decomp_params_frame, textvariable=self.alpha, width=8).grid(row=0, column=1)
+            
+            ttk.Label(self.decomp_params_frame, text="Modes:").grid(row=1, column=0, sticky=tk.W)
+            ttk.Spinbox(self.decomp_params_frame, from_=1, to=5, textvariable=self.modes, width=5).grid(row=1, column=1)
+            
+            if method == "VME":
+                ttk.Label(self.decomp_params_frame, text="Mode to extract:").grid(row=2, column=0, sticky=tk.W)
+                ttk.Spinbox(self.decomp_params_frame, from_=0, to=4, textvariable=self.mode_to_show, width=5).grid(row=2, column=1)
+        
+        elif method == "EMD" and EMD_AVAILABLE:
+            ttk.Label(self.decomp_params_frame, text="IMFs:").grid(row=0, column=0, sticky=tk.W)
+            ttk.Spinbox(self.decomp_params_frame, from_=1, to=5, textvariable=self.modes, width=5).grid(row=0, column=1)
+    
+    def apply_processing(self):
+        if self.audio_data is None:
+            messagebox.showerror("Error", "No audio loaded")
+            return
+        
+        try:
+            method = self.processing_method.get()
+            
+            if method == "No processing":
+                self.processed_audio = self.audio_data.copy()
+            
+            elif method == "Low-pass filter":
+                nyquist = 0.5 * self.sample_rate
+                cutoff = min(self.high_cutoff.get() / nyquist, 0.99)
+                b, a = signal.butter(self.filter_order.get(), cutoff, btype='low')
+                self.processed_audio = signal.filtfilt(b, a, self.audio_data)
+                
+                # Plot both original and filtered for comparison
+                self.fig.clear()
+                ax = self.fig.add_subplot(111)
+                time = np.arange(len(self.audio_data)) / self.sample_rate
+                
+                # Plot original (light red)
+                ax.plot(time, self.audio_data, linewidth=0.5, color='#ff9999', alpha=0.7, label='Original')
+                
+                # Plot filtered (dark red)
+                ax.plot(time, self.processed_audio, linewidth=1, color='#ff3333', label='Filtered')
+                
+                ax.set_title(f"Low-pass Filtered Signal ({self.high_cutoff.get():.0f}Hz)")
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Amplitude")
+                ax.grid(True, alpha=0.3)
+                ax.set_facecolor('#f5f5f5')
+                ax.legend()
+                
+                self.canvas.draw()
+            
+            elif method == "High-pass filter":
+                nyquist = 0.5 * self.sample_rate
+                cutoff = min(self.low_cutoff.get() / nyquist, 0.99)
+                b, a = signal.butter(self.filter_order.get(), cutoff, btype='high')
+                self.processed_audio = signal.filtfilt(b, a, self.audio_data)
+                
+                # Plot both original and filtered for comparison
+                self.fig.clear()
+                ax = self.fig.add_subplot(111)
+                time = np.arange(len(self.audio_data)) / self.sample_rate
+                
+                ax.plot(time, self.audio_data, linewidth=0.5, color='#ff9999', alpha=0.7, label='Original')
+                ax.plot(time, self.processed_audio, linewidth=1, color='#ff3333', label='Filtered')
+                
+                ax.set_title(f"High-pass Filtered Signal ({self.low_cutoff.get():.0f}Hz)")
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Amplitude")
+                ax.grid(True, alpha=0.3)
+                ax.set_facecolor('#f5f5f5')
+                ax.legend()
+                
+                self.canvas.draw()
+            
+            elif method == "Band-pass filter":
+                nyquist = 0.5 * self.sample_rate
+                low = min(self.low_cutoff.get() / nyquist, 0.99)
+                high = min(self.high_cutoff.get() / nyquist, 0.99)
+                
+                if low >= high:
+                    messagebox.showerror("Error", "Low cutoff must be < high cutoff")
+                    return
+                
+                b, a = signal.butter(self.filter_order.get(), [low, high], btype='band')
+                self.processed_audio = signal.filtfilt(b, a, self.audio_data)
+                
+                # Plot both original and filtered for comparison
+                self.fig.clear()
+                ax = self.fig.add_subplot(111)
+                time = np.arange(len(self.audio_data)) / self.sample_rate
+                
+                ax.plot(time, self.audio_data, linewidth=0.5, color='#ff9999', alpha=0.7, label='Original')
+                ax.plot(time, self.processed_audio, linewidth=1, color='#ff3333', label='Filtered')
+                
+                ax.set_title(f"Band-pass Filtered Signal ({self.low_cutoff.get():.0f}-{self.high_cutoff.get():.0f}Hz)")
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Amplitude")
+                ax.grid(True, alpha=0.3)
+                ax.set_facecolor('#f5f5f5')
+                ax.legend()
+                
+                self.canvas.draw()
+            
+            elif method == "HPSS":
+                harmonic, percussive = librosa.effects.hpss(self.audio_data)
+                self.processed_audio = harmonic
+                self.plot_waveform(processed=True)
+            
+            messagebox.showinfo("Success", f"Applied {method}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Processing failed: {str(e)}")
+    
+    def apply_emd(self):
+        """Méthode améliorée pour EMD"""
+        if self.audio_data is None:
+            messagebox.showerror("Error", "No audio loaded")
+            return
+        
+        try:
+            signal_data = np.array(self.audio_data).flatten()
+            K = self.modes.get()
+            
+            if len(signal_data) > 100000:
+                messagebox.showerror("Error", "Signal too long for EMD. Please use a shorter segment.")
+                return
+                
+            imfs = emd.sift.sift(signal_data, 
+                                max_imfs=K, 
+                                imf_opts={'sd_thresh': 0.1})
+            
+            if imfs.shape[1] == 0:
+                messagebox.showerror("Error", "No IMFs found - adjust parameters")
+                return
+                
+            self.decomposition_results = imfs
+            self.processed_audio = np.sum(imfs, axis=1)
+            self.plot_decomposition_result(0)
+            messagebox.showinfo("Success", "EMD applied successfully")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"EMD failed: {str(e)}")
+    
+    def apply_decomposition(self):
+        if self.audio_data is None:
+            messagebox.showerror("Error", "No audio loaded")
+            return
+        
+        method = self.decomposition_method.get()
+        
+        try:
+            if method == "VMD" and VMD_AVAILABLE:
+                alpha = self.alpha.get()
+                K = self.modes.get()
+                
+                if len(self.audio_data) > 100000:
+                    messagebox.showerror("Error", "Signal too long for VMD. Please use a shorter segment.")
+                    return
+                
+                u, u_hat, omega = vmdpy.VMD(self.audio_data, alpha=alpha, tau=0, K=K, DC=0, init=1, tol=1e-7)
+                self.decomposition_results = u
+                self.processed_audio = np.sum(u, axis=0)
+                
+                # Plot all modes for VMD
+                self.plot_all_modes()
+                
+            elif method == "VME" and VMD_AVAILABLE:
+                alpha = self.alpha.get()
+                K = self.modes.get()
+                mode = self.mode_to_show.get()
+                
+                if len(self.audio_data) > 100000:
+                    messagebox.showerror("Error", "Signal too long for VME. Please use a shorter segment.")
+                    return
+                
+                u, u_hat, omega = vmdpy.VMD(self.audio_data, alpha=alpha, tau=0, K=K, DC=0, init=1, tol=1e-7)
+                self.decomposition_results = u
+                
+                if 0 <= mode < K:
+                    self.processed_audio = u[mode]
+                    
+                    # Zoom sur la partie intéressante du signal pour VME
+                    self.fig.clear()
+                    ax = self.fig.add_subplot(111)
+                    
+                    # Prendre seulement une portion du signal pour mieux voir les détails
+                    display_samples = min(5000, len(self.processed_audio))
+                    start_sample = max(0, len(self.processed_audio)//2 - display_samples//2)
+                    end_sample = start_sample + display_samples
+                    
+                    time = np.arange(start_sample, end_sample) / self.sample_rate
+                    ax.plot(time, self.processed_audio[start_sample:end_sample], linewidth=0.5, color='#ff6666')
+                    ax.set_title(f"VME Mode {mode + 1} (Zoom)")
+                    ax.set_xlabel("Time (s)")
+                    ax.set_ylabel("Amplitude")
+                    ax.grid(True, alpha=0.3)
+                    ax.set_facecolor('#f5f5f5')
+                    
+                    self.canvas.draw()
+                else:
+                    messagebox.showerror("Error", f"Invalid mode number (0-{K-1})")
+                    return
+                
+            elif method == "EMD" and EMD_AVAILABLE:
+                self.apply_emd()
+                return
+            
+            else:
+                messagebox.showerror("Error", "Selected method not available")
+                return
+            
+            messagebox.showinfo("Success", f"Applied {method}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Decomposition failed: {str(e)}")
+    
+    def plot_decomposition_result(self, mode_idx):
+        if self.decomposition_results is None:
+            return
+        
+        self.fig.clear()
+        
+        time = np.arange(len(self.audio_data)) / self.sample_rate
+        
+        ax = self.fig.add_subplot(111)
+        
+        method = self.decomposition_method.get()
+        if method in ["VMD", "VME"]:
+            ax.plot(time, self.decomposition_results[mode_idx], linewidth=0.5, color='#ff6666')
+            ax.set_title(f"{method} Mode {mode_idx + 1} of {len(self.decomposition_results)}")
+        elif method == "EMD":
+            ax.plot(time, self.decomposition_results[:, mode_idx], linewidth=0.5, color='#ff6666')
+            ax.set_title(f"EMD IMF {mode_idx + 1} of {self.decomposition_results.shape[1]}")
+        
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('#f5f5f5')
+        
+        self.canvas.draw()
+    
+    def plot_all_modes(self):
+        if self.decomposition_results is None:
+            messagebox.showerror("Error", "No decomposition results available")
+            return
+        
+        self.fig.clear()
+        
+        time = np.arange(len(self.audio_data)) / self.sample_rate
+        method = self.decomposition_method.get()
+        
+        if method in ["VMD", "VME"]:
+            num_modes = len(self.decomposition_results)
+            data = self.decomposition_results
+        elif method == "EMD":
+            num_modes = self.decomposition_results.shape[1]
+            data = self.decomposition_results.T
+        
+        if num_modes > 1:
+            axs = self.fig.subplots(num_modes, 1, sharex=True)
+        else:
+            axs = [self.fig.add_subplot(111)]
+        
+        for i in range(num_modes):
+            if num_modes > 1:
+                ax = axs[i]
+            else:
+                ax = axs[0]
+            
+            if method in ["VMD", "VME"]:
+                ax.plot(time, data[i], linewidth=0.5, color='#ff6666')
+                ax.set_ylabel(f"Mode {i+1}")
+            elif method == "EMD":
+                ax.plot(time, data[i], linewidth=0.5, color='#ff6666')
+                ax.set_ylabel(f"IMF {i+1}")
+            
+            ax.grid(True, alpha=0.3)
+            ax.set_facecolor('#f5f5f5')
+        
+        if num_modes > 1:
+            axs[-1].set_xlabel("Time (s)")
+        else:
+            axs[0].set_xlabel("Time (s)")
+        
+        if method in ["VMD", "VME"]:
+            self.fig.suptitle(f"All {method} Modes (Total: {num_modes})")
+        elif method == "EMD":
+            self.fig.suptitle(f"All EMD IMFs (Total: {num_modes})")
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def plot_waveform(self, processed=False):
+        self.fig.clear()
+        
+        data = self.processed_audio if processed else self.audio_data
+        if data is None:
+            return
+        
+        time = np.arange(len(data)) / self.sample_rate
+        
+        ax = self.fig.add_subplot(111)
+        ax.plot(time, data, linewidth=0.5, color='#ff6666')
+        ax.set_title("Processed Signal" if processed else "Original Signal")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('#f5f5f5')
+        
+        self.canvas.draw()
+    
+    def plot_representation(self):
+        if self.processed_audio is None:
+            messagebox.showerror("Error", "No processed audio available")
+            return
+        
+        self.fig.clear()
+        
+        # Target frequency range (0-2kHz)
+        target_fmin = 0
+        target_fmax = 2000
+        
+        # Verify Nyquist frequency
+        nyquist = 0.5 * self.sample_rate
+        
+        # Adjust frequency range if needed
+        if target_fmax > nyquist:
+            new_fmax = min(target_fmax, nyquist * 0.99)
+            actual_range_msg = f" (adjusted from {target_fmin/1000:.1f}-{target_fmax/1000:.1f}kHz)"
+            fmin, fmax = target_fmin, new_fmax
+        else:
+            actual_range_msg = ""
+            fmin, fmax = target_fmin, target_fmax
+        
+        method = self.representation_method.get()
+        
+        try:
+            if method == "STFT Spectrogram":
+                n_fft = 2048
+                hop_length = 512
+                
+                D = librosa.stft(self.processed_audio, n_fft=n_fft, hop_length=hop_length)
+                S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+                
+                freqs = librosa.fft_frequencies(sr=self.sample_rate, n_fft=n_fft)
+                
+                idx = np.where((freqs >= fmin) & (freqs <= fmax))[0]
+                
+                if len(idx) == 0:
+                    idx = np.where(freqs <= fmax)[0]
+                    if len(idx) == 0:
+                        idx = np.array([0, len(freqs)-1])
+                
+                S_db_filtered = S_db[idx[0]:idx[-1]+1, :]
+                
+                ax = self.fig.add_subplot(111)
+                img = librosa.display.specshow(S_db_filtered, 
+                                             sr=self.sample_rate,
+                                             x_axis='time',
+                                             y_axis='linear',
+                                             fmin=freqs[idx[0]],
+                                             fmax=freqs[idx[-1]],
+                                             ax=ax,
+                                             cmap='magma')
+                ax.set_title(f"STFT Spectrogram ({freqs[idx[0]]:.0f}-{freqs[idx[-1]]:.0f}Hz){actual_range_msg}")
+                self.fig.colorbar(img, ax=ax, format="%+2.0f dB")
+                ax.set_ylim(freqs[idx[0]], freqs[idx[-1]])
+                ax.set_facecolor('#f5f5f5')
+            
+            elif method == "Mel Spectrogram":
+                n_mels = 64
+                S = librosa.feature.melspectrogram(y=self.processed_audio,
+                                                 sr=self.sample_rate,
+                                                 n_mels=n_mels,
+                                                 fmin=fmin,
+                                                 fmax=fmax,
+                                                 n_fft=2048,
+                                                 hop_length=512)
+                
+                S_db = librosa.power_to_db(S, ref=np.max)
+                
+                ax = self.fig.add_subplot(111)
+                img = librosa.display.specshow(S_db,
+                                            sr=self.sample_rate,
+                                            x_axis='time',
+                                            y_axis='mel',
+                                            fmin=fmin,
+                                            fmax=fmax,
+                                            ax=ax,
+                                            cmap='magma')
+                ax.set_title(f"Mel Spectrogram ({fmin/1000:.1f}-{fmax/1000:.1f}kHz){actual_range_msg}")
+                self.fig.colorbar(img, ax=ax, format="%+2.0f dB")
+                ax.set_ylim(fmin, fmax)
+                ax.set_facecolor('#f5f5f5')
+            
+            elif method == "Gammatone Spectrogram":
+                n_mels = 128
+                S = librosa.feature.melspectrogram(y=self.processed_audio,
+                                                 sr=self.sample_rate,
+                                                 n_mels=n_mels,
+                                                 fmin=fmin,
+                                                 fmax=fmax,
+                                                 n_fft=2048,
+                                                 hop_length=512)
+                S_db = librosa.power_to_db(S, ref=np.max)
+                
+                ax = self.fig.add_subplot(111)
+                img = librosa.display.specshow(S_db,
+                                            sr=self.sample_rate,
+                                            x_axis='time',
+                                            y_axis='mel',
+                                            fmin=fmin,
+                                            fmax=fmax,
+                                            ax=ax,
+                                            cmap='magma')
+                ax.set_title(f"Gammatone Spectrogram ({fmin/1000:.1f}-{fmax/1000:.1f}kHz){actual_range_msg}")
+                self.fig.colorbar(img, ax=ax, format="%+2.0f dB")
+                ax.set_ylim(fmin, fmax)
+                ax.set_facecolor('#f5f5f5')
+            
+            self.canvas.draw()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create visualization: {str(e)}")
+    
+    def play_audio(self, processed=False):
+        self.stop_audio()
+        
+        data = self.processed_audio if processed else self.audio_data
+        if data is None:
+            messagebox.showerror("Error", "No audio to play")
+            return
+        
+        try:
+            sd.play(data, self.sample_rate)
+        except Exception as e:
+            messagebox.showerror("Error", f"Playback failed: {str(e)}")
+    
+    def stop_audio(self):
+        sd.stop()
+    
+    def submit_diagnosis(self):
+        user_diag = self.user_diagnosis.get()
+        
+        if not user_diag:
+            messagebox.showerror("Error", "Please select a diagnosis")
+            return
+        
+        # Update history
+        entry = f"File: {self.current_file.get()} | Diagnosis: {user_diag}\n"
+        self.history.append(entry)
+        
+        self.history_text.config(state=tk.NORMAL)
+        self.history_text.insert(tk.END, entry)
+        self.history_text.see(tk.END)
+        self.history_text.config(state=tk.DISABLED)
+        
+        # Compare with true diagnosis
+        if hasattr(self, 'true_diagnosis') and self.true_diagnosis and self.true_diagnosis != "Unknown":
+            is_correct = (user_diag == self.true_diagnosis)
+            result = "CORRECT" if is_correct else "INCORRECT"
+            
+            eval_entry = (f"File: {self.current_file.get()}\n"
+                         f"Your diagnosis: {user_diag}\n"
+                         f"True diagnosis: {self.true_diagnosis}\n"
+                         f"Result: {result}\n"
+                         "----------------\n")
+            
+            self.evaluation_history.append(eval_entry)
+            
+            self.eval_text.config(state=tk.NORMAL)
+            self.eval_text.insert(tk.END, eval_entry)
+            self.eval_text.see(tk.END)
+            self.eval_text.config(state=tk.DISABLED)
+            
+            messagebox.showinfo("Result", f"Your diagnosis is {result}")
+        else:
+            messagebox.showinfo("Success", "Diagnosis submitted (unknown true diagnosis)")
+        
+        self.user_diagnosis.set("")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = LungSoundAnalyzer(root)
+    root.mainloop()
